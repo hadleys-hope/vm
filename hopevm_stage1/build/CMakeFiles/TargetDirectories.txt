@@ -1,0 +1,3 @@
+/home/kevgen/Projects/ITMO_proj/vm/hopevm_stage1/build/CMakeFiles/hopevm.dir
+/home/kevgen/Projects/ITMO_proj/vm/hopevm_stage1/build/CMakeFiles/edit_cache.dir
+/home/kevgen/Projects/ITMO_proj/vm/hopevm_stage1/build/CMakeFiles/rebuild_cache.dir
