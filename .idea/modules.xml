@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/hopevm_stage1.iml" filepath="$PROJECT_DIR$/.idea/hopevm_stage1.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/vm.iml" filepath="$PROJECT_DIR$/.idea/vm.iml" />
     </modules>
   </component>
 </project>
