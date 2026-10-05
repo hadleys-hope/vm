@@ -1,1 +1,0 @@
-/usr/bin/c++ CMakeFiles/hopevm.dir/src/main.cpp.o CMakeFiles/hopevm.dir/src/hbc/HbcReader.cpp.o CMakeFiles/hopevm.dir/src/runtime/Value.cpp.o CMakeFiles/hopevm.dir/src/host/HostFunctions.cpp.o CMakeFiles/hopevm.dir/src/vm/VM.cpp.o -o hopevm 
