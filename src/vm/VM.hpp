@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -19,6 +20,11 @@ struct EventInstance {
     std::vector<runtime::Value> arguments;
 };
 
+// A handler ran longer than its instruction budget (an endless loop, a runaway computation).
+struct BudgetExceeded : std::runtime_error {
+    BudgetExceeded() : std::runtime_error("instruction budget exceeded") {}
+};
+
 struct SimulationStats {
     std::int64_t virtualTimeMs{};
     std::size_t startHandlersInvoked{};
@@ -28,7 +34,17 @@ struct SimulationStats {
 
 class VM {
 public:
-    explicit VM(const hbc::Module& module, std::uint64_t randomSeed = 123);
+    explicit VM(const hbc::Module& module, std::uint64_t randomSeed = 123, host::HouseIo* io = nullptr);
+
+    // Queue an event from outside (the runtime posts "Sensors" when a house's readings arrive).
+    // Returns false if the program declares no such event.
+    bool post(const std::string& name, std::vector<runtime::Value> arguments = {});
+    bool hasEvent(const std::string& name) const { return eventByName_.contains(name); }
+
+    // Loop iterations (backward jumps) and calls the VM may still make; past it the running handler is stopped
+    // with BudgetExceeded. Straight-line code is not metered, it cannot run away.
+    void setStepBudget(std::uint64_t steps) { budget_ = steps; }
+    std::uint64_t stepsExecuted() const { return executed_; }
 
     void initializeGlobals();
     runtime::Value executeFunction(std::uint16_t functionIndex, const std::vector<runtime::Value>& args = {});
@@ -61,6 +77,8 @@ private:
     std::deque<EventInstance> events_;
 
     bool lifecycleStarted_{};
+    std::uint64_t budget_ = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t executed_{};
     std::int64_t virtualTimeMs_{};
     std::vector<bool> atHandlerFired_;
     std::vector<std::int64_t> everyNextDueMs_;

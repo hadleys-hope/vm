@@ -139,7 +139,8 @@ bool equalValues(const runtime::Value& a, const runtime::Value& b) {
 
 } // namespace
 
-VM::VM(const hbc::Module& module, std::uint64_t randomSeed) : module_(module), hosts_(randomSeed) {
+VM::VM(const hbc::Module& module, std::uint64_t randomSeed, host::HouseIo* io)
+    : module_(module), hosts_(randomSeed, io) {
     globals_.resize(module_.globals.size());
     globalInitialized_.assign(module_.globals.size(), false);
     atHandlerFired_.assign(module_.handlers.size(), false);
@@ -211,6 +212,12 @@ runtime::Value VM::executeFunction(const std::string& name, const std::vector<ru
     if (it != functionByName_.end()) return executeFunction(it->second, args);
     if (hosts_.contains(name)) return hosts_.call(name, args);
     throw std::runtime_error("unknown function: " + name);
+}
+
+bool VM::post(const std::string& name, std::vector<runtime::Value> arguments) {
+    if (!eventByName_.contains(name)) return false;
+    emitEvent(name, std::move(arguments));
+    return true;
 }
 
 void VM::emitEvent(const std::string& name, std::vector<runtime::Value> arguments) {
@@ -360,7 +367,15 @@ runtime::Value VM::executeFunction(std::uint16_t functionIndexValue, const std::
     std::vector<runtime::Value> stack;
     std::size_t ip = 0;
 
+    // Every loop iteration goes through a backward jump and every recursion through a call, so charging only
+    // those two stops any runaway handler while straight-line code runs unmetered (no cost per instruction).
+    auto charge = [&]() {
+        if (budget_ == 0) throw BudgetExceeded();
+        --budget_;
+        ++executed_;
+    };
     auto jumpRelative = [&](std::int32_t displacement) {
+        if (displacement < 0) charge();
         const auto target = static_cast<std::int64_t>(ip) + displacement;
         if (target < 0 || target >= static_cast<std::int64_t>(function.code.size())) throw std::runtime_error("jump target out of range");
         ip = static_cast<std::size_t>(target);
@@ -432,6 +447,7 @@ runtime::Value VM::executeFunction(std::uint16_t functionIndexValue, const std::
                 break;
             }
             case OP_CALL: {
+                charge();
                 const auto name = hbc::stringConstant(module_, readU16(function.code, ip));
                 const auto argc = readU16(function.code, ip);
                 std::vector<runtime::Value> callArgs(argc);
