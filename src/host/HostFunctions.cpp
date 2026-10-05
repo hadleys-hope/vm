@@ -24,8 +24,9 @@ void expectArity(const std::string& name, const std::vector<runtime::Value>& arg
 
 } // namespace
 
-Registry::Registry(std::uint64_t seed) : rng_(seed) {
+Registry::Registry(std::uint64_t seed, HouseIo* io) : rng_(seed), io_(io) {
     installBuiltins();
+    if (io_) installHouseIo();
 }
 
 bool Registry::contains(const std::string& name) const {
@@ -83,9 +84,15 @@ void Registry::installBuiltins() {
         return std::cos(expect<double>(args[0], "real"));
     };
 
-    functions_["log"] = [](const auto& args) -> runtime::Value {
+    functions_["log"] = [this](const auto& args) -> runtime::Value {
         expectArity("log", args, 1);
-        std::cout << "[hope] " << expect<std::string>(args[0], "string") << '\n';
+        const auto& line = expect<std::string>(args[0], "string");
+        if (io_) {  // 5000 houses must not write to one stdout: the runtime drains and publishes these
+            if (io_->logs.size() >= HouseIo::kMaxLogs) io_->logs.pop_front();
+            io_->logs.push_back(line.substr(0, 512));
+        } else {
+            std::cout << "[hope] " << line << '\n';
+        }
         return runtime::Unit{};
     };
 
@@ -94,6 +101,32 @@ void Registry::installBuiltins() {
         const auto& name = expect<std::string>(args[0], "string");
         std::cout << "[metric] " << name << '=' << runtime::valueToString(args[1]) << '\n';
         return runtime::Unit{};
+    };
+}
+
+void Registry::installHouseIo() {
+    // A sensor the world has not sent (yet) reads as 0.0: a program must not crash because a field is missing.
+    functions_["sense"] = [this](const auto& args) -> runtime::Value {
+        expectArity("sense", args, 1);
+        const auto it = io_->sensors.find(expect<std::string>(args[0], "string"));
+        return it == io_->sensors.end() ? 0.0 : it->second;
+    };
+
+    functions_["act"] = [this](const auto& args) -> runtime::Value {
+        expectArity("act", args, 2);
+        io_->actuators[expect<std::string>(args[0], "string")] = expect<double>(args[1], "real");
+        return runtime::Unit{};
+    };
+
+    functions_["act_text"] = [this](const auto& args) -> runtime::Value {
+        expectArity("act_text", args, 2);
+        io_->texts[expect<std::string>(args[0], "string")] = expect<std::string>(args[1], "string").substr(0, 64);
+        return runtime::Unit{};
+    };
+
+    functions_["house_id"] = [this](const auto& args) -> runtime::Value {
+        expectArity("house_id", args, 0);
+        return io_->houseId;
     };
 }
 
