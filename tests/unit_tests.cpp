@@ -56,7 +56,22 @@ static void flatJson() {
     CHECK(out == R"("say \"hi\"\u000a")");
 }
 
+static void columnarJson() {
+    std::map<std::string, std::vector<double>> cols;
+    std::map<std::string, double> scalars;
+    hope::colony::readColumnarJson(
+        R"({"t": 9, "id": [3, 11], "t_in": [20.5, -1e1], "on_ups": [false, true], "mode": "ONLINE",)"
+        R"( "names": ["a", "b"], "empty": [], "last": [7]})",
+        [&](const std::string& k, const std::vector<double>& v) { cols[k] = v; },
+        [&](const std::string& k, double v) { scalars[k] = v; });
+    CHECK(scalars.size() == 1 && scalars["t"] == 9);
+    CHECK((cols["id"] == std::vector<double>{3, 11}) && (cols["t_in"] == std::vector<double>{20.5, -10}));
+    CHECK((cols["on_ups"] == std::vector<double>{0, 1}) && !cols.contains("names") && cols["empty"].empty());
+    CHECK((cols["last"] == std::vector<double>{7}));
+}
+
 int main() {
+    columnarJson();
     remainingLength();
     packets();
     flatJson();

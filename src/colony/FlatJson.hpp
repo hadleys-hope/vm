@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace hope::colony {
 
@@ -62,6 +63,85 @@ void readFlatJson(std::string_view s, OnNumber onNumber, OnText onText) {
             if (ec != std::errc{}) return;
             onNumber(key, v);
             i = static_cast<std::size_t>(ptr - s.data());
+        }
+        ws();
+        if (i < s.size() && s[i] == ',') { ++i; continue; }
+        return;
+    }
+}
+
+// Reads a JSON object of columns: {"t": 7, "id": [1, 5], "t_in": [20.5, 18.0], "on_ups": [false, true]}.
+// Number and boolean arrays go to onColumn(key, values); a plain number goes to onScalar(key, value).
+// Strings, nulls and arrays of anything else are skipped.
+template <class OnColumn, class OnScalar>
+void readColumnarJson(std::string_view s, OnColumn onColumn, OnScalar onScalar) {
+    std::size_t i = 0;
+    auto ws = [&] { while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) ++i; };
+    auto key = [&](std::string& out) -> bool {
+        if (i >= s.size() || s[i] != '"') return false;
+        ++i;
+        out.clear();
+        while (i < s.size() && s[i] != '"') { if (s[i] == '\\' && i + 1 < s.size()) ++i; out.push_back(s[i++]); }
+        if (i >= s.size()) return false;
+        ++i;
+        return true;
+    };
+    auto skipValue = [&] {
+        int depth = 0;
+        bool inStr = false;
+        for (; i < s.size(); ++i) {
+            const char c = s[i];
+            if (inStr) { if (c == '\\') ++i; else if (c == '"') inStr = false; continue; }
+            if (c == '"') inStr = true;
+            else if (c == '{' || c == '[') ++depth;
+            else if (c == '}' || c == ']') { if (depth == 0) return; if (--depth == 0) { ++i; return; } }
+            else if (c == ',' && depth == 0) return;
+        }
+    };
+    auto number = [&](double& v) -> bool {
+        if (s.substr(i, 4) == "true") { v = 1.0; i += 4; return true; }
+        if (s.substr(i, 5) == "false") { v = 0.0; i += 5; return true; }
+        const auto [ptr, ec] = std::from_chars(s.data() + i, s.data() + s.size(), v);
+        if (ec != std::errc{}) return false;
+        i = static_cast<std::size_t>(ptr - s.data());
+        return true;
+    };
+    ws();
+    if (i >= s.size() || s[i] != '{') return;
+    ++i;
+    std::string k;
+    std::vector<double> values;
+    while (true) {
+        ws();
+        if (i >= s.size() || s[i] == '}') return;
+        if (!key(k)) return;
+        ws();
+        if (i >= s.size() || s[i] != ':') return;
+        ++i;
+        ws();
+        if (i < s.size() && s[i] == '[') {
+            const std::size_t start = i;
+            ++i;
+            values.clear();
+            bool numeric = true;
+            while (true) {
+                ws();
+                if (i < s.size() && s[i] == ']') { ++i; break; }
+                double v;
+                if (!number(v)) { numeric = false; break; }
+                values.push_back(v);
+                ws();
+                if (i < s.size() && s[i] == ',') { ++i; continue; }
+                if (i < s.size() && s[i] == ']') { ++i; break; }
+                return;
+            }
+            if (numeric) onColumn(k, values);
+            else { i = start; skipValue(); }
+        } else {
+            double v;
+            const std::size_t start = i;
+            if (number(v)) onScalar(k, v);
+            else { i = start; skipValue(); }
         }
         ws();
         if (i < s.size() && s[i] == ',') { ++i; continue; }
