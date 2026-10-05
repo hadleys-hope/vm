@@ -5,6 +5,8 @@
 //
 // Bus (same as the Python controllers in world): in hh/house/{id}/sensors, hh/env/weather, hh/env/power;
 // out hh/house/{id}/actuators, hh/house/{id}/log, hh/runtime/status.
+// Batched: in hh/batch/sensors (one message per tick, columns: {"t":..,"id":[..],"t_in":[..],..}); a house that
+// came in a batch is answered in hh/batch/actuators ({"rows":[{"id":..,"heater_on":..},..]}, one per worker pass).
 // House i runs programs[i % k]. Houses are sharded over worker threads by id % threads; each VM is only ever
 // touched by its own worker, so the VMs need no locks. A shard keeps only the newest reading per house: if a
 // worker falls behind, stale readings are dropped instead of queueing up (memory and latency stay bounded).
@@ -61,6 +63,8 @@ struct Program {
     hbc::Module module;
 };
 
+using Readings = std::vector<std::pair<std::string, double>>;
+
 struct House {
     int id{};
     const Program* program{};
@@ -68,8 +72,9 @@ struct House {
     std::unique_ptr<vm::VM> vm;
     int faults{};
     std::int64_t quarantinedUntil{-1};
-    std::string pending;  // newest unprocessed sensors payload (guarded by the shard mutex)
+    Readings pending;  // newest unprocessed readings (guarded by the shard mutex)
     bool dirty{};
+    bool batched{};    // the pending readings came in a batch: answer in a batch
 };
 
 struct Env {  // hh/env/weather and hh/env/power, merged into every house's readings
@@ -100,13 +105,14 @@ public:
     std::condition_variable cv;
     std::vector<House*> dirty;
 
-    void offer(int id, std::string_view payload, Stats& stats) {
+    void offer(int id, Readings readings, bool batched, Stats& stats) {
         const auto it = byId.find(id);
         if (it == byId.end()) return;
         {
             std::lock_guard lock(m);
             House* h = it->second;
-            h->pending.assign(payload);
+            h->pending = std::move(readings);
+            h->batched = batched;
             if (h->dirty) ++stats.coalesced; else { h->dirty = true; dirty.push_back(h); }
         }
         cv.notify_one();
@@ -142,11 +148,18 @@ void buildVm(House& h) {
 }
 
 // Runs one reading through the house's program; returns the actuator payload ("" if nothing to send).
-std::string runHouse(House& h, std::string_view payload, const std::vector<std::pair<std::string, double>>& env,
+Readings parseReadings(std::string_view payload) {
+    Readings out;
+    colony::readFlatJson(payload, [&](const std::string& k, double v) { out.emplace_back(k, v); },
+                         [](const std::string&, const std::string&) {});
+    return out;
+}
+
+// Returns the actuators as the inside of a JSON object (no braces, no id): "\"t\":5,\"heater_on\":true,..."
+std::string runHouse(House& h, const Readings& readings, const std::vector<std::pair<std::string, double>>& env,
                      const Options& o, Stats& stats, std::vector<std::string>& logs) {
     for (const auto& [k, v] : env) h.io.sensors[k] = v;
-    colony::readFlatJson(payload, [&](const std::string& k, double v) { h.io.sensors[k] = v; },
-                         [](const std::string&, const std::string&) {});
+    for (const auto& [k, v] : readings) h.io.sensors[k] = v;
     const auto tick = static_cast<std::int64_t>(h.io.sensors["t"]);
     if (h.quarantinedUntil >= 0 && tick < h.quarantinedUntil) { ++stats.skipped; return ""; }
     if (h.quarantinedUntil >= 0) { h.quarantinedUntil = -1; h.faults = 0; --stats.quarantined; }
@@ -180,7 +193,7 @@ std::string runHouse(House& h, std::string_view payload, const std::vector<std::
         h.io.logs.pop_front();
     }
     if (h.io.actuators.empty() && h.io.texts.empty()) return "";
-    std::string out = "{\"t\":" + std::to_string(tick);
+    std::string out = "\"t\":" + std::to_string(tick);
     for (const auto& [k, v] : h.io.actuators) {
         out += ",";
         colony::appendJsonString(out, k);
@@ -194,35 +207,48 @@ std::string runHouse(House& h, std::string_view payload, const std::vector<std::
         out += ":";
         colony::appendJsonString(out, v);
     }
-    return out + "}";
+    return out;
 }
 
 void worker(Shard& shard, Env& env, const Options& o, Stats& stats, mqtt::Client* client) {
     std::vector<House*> batch;
-    std::vector<std::string> payloads, logs;
+    std::vector<Readings> readings;
+    std::vector<char> batchedFlags;
+    std::vector<std::string> logs;
+    std::string rows;
     char topic[64];
     while (running) {
         {
             std::unique_lock lock(shard.m);
             shard.cv.wait_for(lock, std::chrono::milliseconds(100), [&] { return !shard.dirty.empty() || !running; });
             batch.swap(shard.dirty);
-            payloads.clear();
-            for (House* h : batch) { payloads.push_back(std::move(h->pending)); h->dirty = false; }
+            readings.clear();
+            batchedFlags.clear();
+            for (House* h : batch) {
+                readings.push_back(std::move(h->pending));
+                batchedFlags.push_back(h->batched);
+                h->dirty = false;
+            }
         }
         if (batch.empty()) continue;
         const auto envNow = env.copy();
+        rows.clear();
         for (std::size_t i = 0; i < batch.size(); ++i) {
             House& h = *batch[i];
             logs.clear();
-            const auto out = runHouse(h, payloads[i], envNow, o, stats, logs);
+            const auto out = runHouse(h, readings[i], envNow, o, stats, logs);
             if (!client) continue;
-            if (!out.empty()) {
+            if (!out.empty() && batchedFlags[i]) {
+                rows += rows.empty() ? "{\"id\":" : ",{\"id\":";
+                rows += std::to_string(h.id) + "," + out + "}";
+            } else if (!out.empty()) {
                 std::snprintf(topic, sizeof topic, "hh/house/%d/actuators", h.id);
-                client->publish(topic, out);
+                client->publish(topic, "{" + out + "}");
             }
             std::snprintf(topic, sizeof topic, "hh/house/%d/log", h.id);
             for (const auto& l : logs) client->publish(topic, l);
         }
+        if (client && !rows.empty()) client->publish("hh/batch/actuators", "{\"rows\":[" + rows + "]}");
         batch.clear();
     }
 }
@@ -302,7 +328,9 @@ int main(int argc, char** argv) {
         for (auto& s : shards) workers.emplace_back(worker, std::ref(*s), std::ref(env), std::cref(o), std::ref(stats), nullptr);
         const auto t0 = Clock::now();
         for (int round = 0; round < o.bench; ++round) {
-            for (auto& h : houses) shards[h->id % o.threads]->offer(h->id, syntheticSensors(h->id, round), stats);
+            for (auto& h : houses) {
+                shards[h->id % o.threads]->offer(h->id, parseReadings(syntheticSensors(h->id, round)), false, stats);
+            }
             while (running) {  // one round at a time, like the world's ticks
                 bool idle = true;
                 for (auto& s : shards) { std::lock_guard lock(s->m); if (!s->dirty.empty()) idle = false; }
@@ -325,7 +353,22 @@ int main(int argc, char** argv) {
         if (topic.starts_with("hh/house/") && topic.ends_with("/sensors")) {
             int id = 0;
             for (char c : topic.substr(9)) { if (c < '0' || c > '9') break; id = id * 10 + (c - '0'); }
-            shards[id % o.threads]->offer(id, payload, stats);
+            shards[id % o.threads]->offer(id, parseReadings(payload), false, stats);
+        } else if (topic == "hh/batch/sensors") {
+            std::vector<std::pair<std::string, std::vector<double>>> columns;
+            Readings common;
+            colony::readColumnarJson(
+                payload, [&](const std::string& k, const std::vector<double>& v) { columns.emplace_back(k, v); },
+                [&](const std::string& k, double v) { common.emplace_back(k, v); });
+            const std::vector<double>* ids = nullptr;
+            for (const auto& [k, v] : columns) if (k == "id") ids = &v;
+            if (!ids) return;
+            for (std::size_t row = 0; row < ids->size(); ++row) {
+                Readings r = common;
+                for (const auto& [k, v] : columns) if (row < v.size()) r.emplace_back(k, v[row]);
+                const int id = static_cast<int>((*ids)[row]);
+                if (id >= 0) shards[id % o.threads]->offer(id, std::move(r), true, stats);
+            }
         } else if (topic == "hh/env/weather" || topic == "hh/env/power") {
             env.set(payload);
         }
@@ -339,6 +382,7 @@ int main(int argc, char** argv) {
             try {
                 client.connect();
                 client.subscribe("hh/house/+/sensors");
+                client.subscribe("hh/batch/sensors");
                 client.subscribe("hh/env/weather");
                 client.subscribe("hh/env/power");
                 std::fprintf(stderr, "hope-runtime: connected to %s:%d\n", o.host.c_str(), o.port);

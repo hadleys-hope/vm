@@ -85,6 +85,11 @@ hope-runtime --programs comfort.hbc,eco.hbc,night_setback.hbc,storm_ready.hbc,du
 - the MQTT client (`src/mqtt`) is a minimal MQTT 3.1.1 client, QoS 0, written for this project; on a lost
   connection the runtime reconnects with backoff and resubscribes.
 
+Batched bus (for thousands of houses; the world runs with `--mqtt-batch`): the world sends one
+`hh/batch/sensors` message per tick with the readings as columns (`{"t":..,"id":[..],"t_in":[..],..}`), and a house
+that came in a batch is answered in `hh/batch/actuators` (`{"rows":[{"id":..,"heater_on":..,..},..]}`, one message per
+worker pass). Both modes work at the same time.
+
 `--bench R` runs without a broker: every house gets R synthetic readings, and the throughput is printed.
 
 ## bus-bench
@@ -106,4 +111,5 @@ does) and measures the replies and their latency; `--monitor` adds a subscriber 
 | `--bench`, 5000 houses, 1 thread | 117 000 readings/s; handler p50 4.1 us, p99 34 us |
 | broker + runtime, 5000 houses, 20 ticks/s, every house every 10 ticks, with a `hh/#` monitor | 10 060 readings/s in, 10 060 replies/s out, 20 120/s to the monitor; all replied, p99 48 ms; Mosquitto 16 % and the runtime 12 % of the core |
 | the same at every house every tick | 39 600/s each way, all replied, p99 460 ms: the single core is saturated by the generator, broker and runtime together |
+| world (Python) + Mosquitto + runtime, 5040 houses, batched bus | 20 ticks/s held: world tick 15.9 ms, publish 3.5 ms (40 ms per house-message), every house under VM control |
 | 500 of 1000 houses running an endless loop | each faulted 3 times and was quarantined; the other 500 answered every reading |
