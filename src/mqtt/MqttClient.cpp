@@ -62,8 +62,8 @@ std::vector<std::uint8_t> encodeSubscribe(std::uint16_t packetId, std::string_vi
     return packet(SUBSCRIBE, body);
 }
 
-std::vector<std::uint8_t> encodePublish(std::string_view topic, std::string_view payload) {
-    std::vector<std::uint8_t> out{PUBLISH};
+std::vector<std::uint8_t> encodePublish(std::string_view topic, std::string_view payload, bool retain) {
+    std::vector<std::uint8_t> out{static_cast<std::uint8_t>(PUBLISH | (retain ? 0x01 : 0x00))};
     appendRemainingLength(out, 2 + topic.size() + payload.size());
     appendString(out, topic);
     out.insert(out.end(), payload.begin(), payload.end());
@@ -117,9 +117,9 @@ void Client::subscribe(std::string_view filter) {
     }
 }
 
-bool Client::publish(std::string_view topic, std::string_view payload) {
+bool Client::publish(std::string_view topic, std::string_view payload, bool retain) {
     if (!connected_) return false;
-    if (!writeAll(encodePublish(topic, payload))) return false;
+    if (!writeAll(encodePublish(topic, payload, retain))) return false;
     ++sent_;
     return true;
 }

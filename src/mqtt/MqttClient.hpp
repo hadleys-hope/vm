@@ -14,7 +14,7 @@ namespace hope::mqtt {
 // Packet encoding, separate from the socket so it can be tested without a broker.
 std::vector<std::uint8_t> encodeConnect(std::string_view clientId, std::uint16_t keepAliveSeconds);
 std::vector<std::uint8_t> encodeSubscribe(std::uint16_t packetId, std::string_view filter);
-std::vector<std::uint8_t> encodePublish(std::string_view topic, std::string_view payload);
+std::vector<std::uint8_t> encodePublish(std::string_view topic, std::string_view payload, bool retain = false);
 std::vector<std::uint8_t> encodePing();
 void appendRemainingLength(std::vector<std::uint8_t>& out, std::size_t length);
 
@@ -32,7 +32,7 @@ public:
 
     void connect(int timeoutMs = 3000);  // throws on failure
     void subscribe(std::string_view filter);
-    bool publish(std::string_view topic, std::string_view payload);  // false if not connected
+    bool publish(std::string_view topic, std::string_view payload, bool retain = false);  // false if not connected
     void close();
     bool connected() const { return connected_; }
 
