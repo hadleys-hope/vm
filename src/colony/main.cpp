@@ -17,6 +17,7 @@
 #include "hbc/HbcReader.hpp"
 #include "host/HouseIo.hpp"
 #include "mqtt/MqttClient.hpp"
+#include "vm/Disasm.hpp"
 #include "vm/VM.hpp"
 
 #include <algorithm>
@@ -58,7 +59,12 @@ struct Options {
     std::string clientId = "hope-runtime";
 };
 
+// The house whose next run is recorded and published on hh/runtime/trace: asked for on
+// hh/runtime/trace/request, otherwise a different house every 1.5 s so every program shows up.
+std::atomic<int> traceHouse{-1};
+
 struct Program {
+    std::string source;   // the .hope next to the .hbc, if there is one
     std::string name;
     hbc::Module module;
 };
@@ -148,6 +154,71 @@ void buildVm(House& h) {
 }
 
 // Runs one reading through the house's program; returns the actuator payload ("" if nothing to send).
+std::string jsonString(std::string_view s) {
+    std::string out;
+    colony::appendJsonString(out, s);
+    return out;
+}
+
+// One recorded handler run: what the house read, every instruction (function index, ip), every call out
+// of the program with its arguments and result, and what it decided. Marked with "trace" so the worker
+// publishes it on hh/runtime/trace instead of the house's log.
+std::string traceJson(const House& h, const vm::Trace& t, std::int64_t tick, double us) {
+    std::string out = "{\"trace\":true,\"house\":" + std::to_string(h.id) + ",\"program\":" + jsonString(h.program->name) +
+                      ",\"tick\":" + std::to_string(tick) + ",\"us\":" + std::to_string(static_cast<int>(us)) + ",\"steps\":[";
+    for (std::size_t i = 0; i < t.steps.size(); ++i)
+        out += (i ? ",[" : "[") + std::to_string(t.steps[i].fn) + "," + std::to_string(t.steps[i].ip) + "]";
+    out += "],\"calls\":[";
+    for (std::size_t i = 0; i < t.calls.size(); ++i) {
+        const auto& c = t.calls[i];
+        out += (i ? ",{" : "{") + std::string("\"step\":") + std::to_string(c.step) + ",\"name\":" + jsonString(c.name) +
+               ",\"args\":" + jsonString(c.args) + ",\"result\":" + jsonString(c.result) + "}";
+    }
+    out += "],\"sensors\":{";
+    bool first = true;
+    for (const auto& [k, v] : h.io.sensors) {
+        out += (first ? "" : ",") + jsonString(k) + ":";
+        colony::appendJsonNumber(out, v);
+        first = false;
+    }
+    out += "},\"actuators\":{";
+    first = true;
+    for (const auto& [k, v] : h.io.actuators) {
+        out += (first ? "" : ",") + jsonString(k) + ":";
+        colony::appendJsonNumber(out, v);
+        first = false;
+    }
+    for (const auto& [k, v] : h.io.texts) {
+        out += (first ? "" : ",") + jsonString(k) + ":" + jsonString(v);
+        first = false;
+    }
+    out += "},\"topic\":" + jsonString(h.batched ? "hh/batch/actuators" : "hh/house/" + std::to_string(h.id) + "/actuators") + "}";
+    return out;
+}
+
+// Every program: its source, its functions as readable bytecode, and how many houses run it.
+std::string programsJson(const std::vector<std::unique_ptr<Program>>& programs, int houses) {
+    std::string out = "[";
+    for (std::size_t p = 0; p < programs.size(); ++p) {
+        const auto& prog = *programs[p];
+        const auto& m = prog.module;
+        out += (p ? ",{" : "{") + std::string("\"name\":") + jsonString(prog.name) + ",\"source\":" + jsonString(prog.source) +
+               ",\"houses\":" + std::to_string(houses / static_cast<int>(programs.size()) + (static_cast<int>(p) < houses % static_cast<int>(programs.size()) ? 1 : 0)) +
+               ",\"functions\":[";
+        for (std::size_t f = 0; f < m.functions.size(); ++f) {
+            const auto& fn = m.functions[f];
+            out += (f ? ",{" : "{") + std::string("\"name\":") + jsonString(hbc::stringConstant(m, fn.nameConstant)) +
+                   ",\"params\":" + std::to_string(fn.parameterCount) + ",\"locals\":" + std::to_string(fn.localCount) + ",\"code\":[";
+            const auto code = vm::disassemble(m, fn);
+            for (std::size_t i = 0; i < code.size(); ++i)
+                out += (i ? ",[" : "[") + std::to_string(code[i].ip) + "," + jsonString(code[i].op) + "," + jsonString(code[i].args) + "]";
+            out += "]}";
+        }
+        out += "],\"bytes\":" + std::to_string([&] { std::size_t n = 0; for (const auto& fn : m.functions) n += fn.code.size(); return n; }()) + "}";
+    }
+    return out + "]";
+}
+
 Readings parseReadings(std::string_view payload) {
     Readings out;
     colony::readFlatJson(payload, [&](const std::string& k, double v) { out.emplace_back(k, v); },
@@ -170,9 +241,17 @@ std::string runHouse(House& h, const Readings& readings, const std::vector<std::
         h.io.actuators.clear();
         h.io.texts.clear();
         h.vm->setStepBudget(o.budget);
+        int want = h.id;
+        const bool tracing = traceHouse.load() == h.id && traceHouse.compare_exchange_strong(want, -1);
+        vm::Trace trace;
+        if (tracing) h.vm->setTrace(&trace);
         h.vm->simulateUntil(tick * 60000, 64);  // every/at handlers on the world's clock, 1 tick = 1 minute
         h.vm->post("Sensors");
         h.vm->dispatchEvents();
+        if (tracing) {
+            h.vm->setTrace(nullptr);
+            logs.push_back(traceJson(h, trace, tick, std::chrono::duration<double, std::micro>(Clock::now() - t0).count()));
+        }
     } catch (const std::exception& e) {
         ++stats.faults;
         h.vm.reset();  // rebuilt from scratch on the next reading
@@ -246,7 +325,7 @@ void worker(Shard& shard, Env& env, const Options& o, Stats& stats, mqtt::Client
                 client->publish(topic, "{" + out + "}");
             }
             std::snprintf(topic, sizeof topic, "hh/house/%d/log", h.id);
-            for (const auto& l : logs) client->publish(topic, l);
+            for (const auto& l : logs) client->publish(l.rfind("{\"trace\":true", 0) == 0 ? "hh/runtime/trace" : topic, l);
         }
         if (client && !rows.empty()) client->publish("hh/batch/actuators", "{\"rows\":[" + rows + "]}");
         batch.clear();
@@ -296,6 +375,8 @@ int main(int argc, char** argv) {
         auto p = std::make_unique<Program>();
         p->name = std::filesystem::path(path).stem().string();
         p->module = hbc::Reader::readFile(path);
+        std::ifstream src(std::filesystem::path(path).replace_extension(".hope"));
+        if (src) p->source.assign(std::istreambuf_iterator<char>(src), std::istreambuf_iterator<char>());
         programs.push_back(std::move(p));
     }
     const long rss0 = rssKb();
@@ -369,6 +450,9 @@ int main(int argc, char** argv) {
                 const int id = static_cast<int>((*ids)[row]);
                 if (id >= 0) shards[id % o.threads]->offer(id, std::move(r), true, stats);
             }
+        } else if (topic == "hh/runtime/trace/request") {
+            colony::readFlatJson(payload, [&](const std::string& k, double v) { if (k == "house") traceHouse = static_cast<int>(v); },
+                                 [](const std::string&, const std::string&) {});
         } else if (topic == "hh/env/weather" || topic == "hh/env/power") {
             env.set(payload);
         }
@@ -377,6 +461,8 @@ int main(int argc, char** argv) {
     for (auto& s : shards) workers.emplace_back(worker, std::ref(*s), std::ref(env), std::cref(o), std::ref(stats), &client);
     int backoffMs = 250;
     auto lastStatus = Clock::now();
+    auto traceSince = Clock::now();
+    int traceNext = 0;
     while (running) {
         if (!client.connected()) {
             try {
@@ -385,6 +471,8 @@ int main(int argc, char** argv) {
                 client.subscribe("hh/batch/sensors");
                 client.subscribe("hh/env/weather");
                 client.subscribe("hh/env/power");
+                client.subscribe("hh/runtime/trace/request");
+                client.publish("hh/runtime/programs", programsJson(programs, o.houses), true);
                 std::fprintf(stderr, "hope-runtime: connected to %s:%d\n", o.host.c_str(), o.port);
                 backoffMs = 250;
             } catch (const std::exception& e) {
@@ -395,6 +483,14 @@ int main(int argc, char** argv) {
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // a sampled trace every 1.5 s, stepping through the houses so every program shows; a house that gets
+        // no reading within 3 s (not served, quarantined) is skipped
+        const double traceAge = std::chrono::duration<double>(Clock::now() - traceSince).count();
+        if ((traceHouse.load() == -1 && traceAge > 1.5) || traceAge > 3.0) {   // taken, or stale: next house
+            traceNext = (traceNext + 97) % std::max(1, o.houses);
+            traceHouse = traceNext;
+            traceSince = Clock::now();
+        }
         const double since = std::chrono::duration<double>(Clock::now() - lastStatus).count();
         if (since >= 2.0) {
             client.publish("hh/runtime/status", statusJson(o, stats, &client, since));
