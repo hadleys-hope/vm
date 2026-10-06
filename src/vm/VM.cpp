@@ -382,6 +382,8 @@ runtime::Value VM::executeFunction(std::uint16_t functionIndexValue, const std::
     };
 
     while (ip < function.code.size()) {
+        if (trace_ && trace_->steps.size() < Trace::kMaxSteps)
+            trace_->steps.push_back({functionIndexValue, static_cast<std::uint32_t>(ip)});
         const auto opcode = function.code[ip++];
         switch (opcode) {
             case OP_NOP: break;
@@ -452,6 +454,17 @@ runtime::Value VM::executeFunction(std::uint16_t functionIndexValue, const std::
                 const auto argc = readU16(function.code, ip);
                 std::vector<runtime::Value> callArgs(argc);
                 for (std::size_t i = argc; i-- > 0;) callArgs[i] = pop(stack);
+                if (trace_ && !functionByName_.contains(name)) {
+                    // calls out of the program (sense, act, log, ...) are what a trace is for
+                    TraceCall call{static_cast<std::uint32_t>(trace_->steps.size()), name, "", ""};
+                    for (std::size_t i = 0; i < callArgs.size(); ++i)
+                        call.args += (i ? ", " : "") + runtime::valueToString(callArgs[i]);
+                    auto result = executeFunction(name, callArgs);
+                    if (!std::holds_alternative<runtime::Unit>(result)) call.result = runtime::valueToString(result);
+                    trace_->calls.push_back(std::move(call));
+                    stack.push_back(std::move(result));
+                    break;
+                }
                 stack.push_back(executeFunction(name, callArgs));
                 break;
             }

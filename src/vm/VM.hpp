@@ -25,6 +25,24 @@ struct BudgetExceeded : std::runtime_error {
     BudgetExceeded() : std::runtime_error("instruction budget exceeded") {}
 };
 
+// A recorded run, for watching a program work: every instruction executed (function, ip) and every call
+// out of the program (host functions, events) with its arguments, its result and the step it happened at.
+struct TraceStep {
+    std::uint16_t fn{};
+    std::uint32_t ip{};
+};
+struct TraceCall {
+    std::uint32_t step{};
+    std::string name;
+    std::string args;
+    std::string result;
+};
+struct Trace {
+    std::vector<TraceStep> steps;
+    std::vector<TraceCall> calls;
+    static constexpr std::size_t kMaxSteps = 20000;
+};
+
 struct SimulationStats {
     std::int64_t virtualTimeMs{};
     std::size_t startHandlersInvoked{};
@@ -44,6 +62,8 @@ public:
     // Loop iterations (backward jumps) and calls the VM may still make; past it the running handler is stopped
     // with BudgetExceeded. Straight-line code is not metered, it cannot run away.
     void setStepBudget(std::uint64_t steps) { budget_ = steps; }
+    // Record the next runs into trace (nullptr stops recording). Costs one pointer test per instruction.
+    void setTrace(Trace* trace) { trace_ = trace; }
     std::uint64_t stepsExecuted() const { return executed_; }
 
     void initializeGlobals();
@@ -78,6 +98,7 @@ private:
 
     bool lifecycleStarted_{};
     std::uint64_t budget_ = std::numeric_limits<std::uint64_t>::max();
+    Trace* trace_ = nullptr;
     std::uint64_t executed_{};
     std::int64_t virtualTimeMs_{};
     std::vector<bool> atHandlerFired_;

@@ -15,6 +15,7 @@ add_library(libhopevm STATIC
     src/runtime/Value.cpp
     src/host/HostFunctions.cpp
     src/vm/VM.cpp
+    src/vm/Disasm.cpp
 )
 target_include_directories(libhopevm PUBLIC src)
 target_compile_options(libhopevm PRIVATE -Wall -Wextra -Wpedantic)
